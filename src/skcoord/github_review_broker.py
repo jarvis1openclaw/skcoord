@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -98,6 +99,20 @@ class GitHubReviewBroker:
             **({"error": error} if error else {}),
         })
 
+    def _github_call(self, method: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run an untrusted network adapter call under the broker deadline."""
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-broker")
+        future = executor.submit(method, *args, **kwargs)
+        try:
+            return future.result(timeout=self._timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("GitHub request timed out") from exc
+        finally:
+            # Do not wait for a wedged network client after the deadline.  The
+            # client owns cancellation of its underlying request where possible.
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def submit_review(self, request: ReviewRequest) -> Mapping[str, Any]:
         """Validate and submit one review; failures are audited and raised."""
         if not request.request_id:
@@ -116,16 +131,19 @@ class GitHubReviewBroker:
                 if self._seen_request(request.request_id):
                     raise BrokerError("replayed request")
                 self._validate(request)
-                current = self._client.pull_request(request.repository, request.pull_request)
+                current = self._github_call(self._client.pull_request, request.repository,
+                                             request.pull_request)
                 if str(current.get("head_sha", "")) != request.head:
                     raise BrokerError("head drift")
                 if str(current.get("author", "")) == self._reviewer:
                     raise BrokerError("same-author review")
-                checks = self._client.required_checks(request.repository, request.head)
+                checks = self._github_call(self._client.required_checks, request.repository,
+                                           request.head)
                 if not checks or any(str(v).lower() not in _TERMINAL_SUCCESS for v in checks.values()):
                     raise BrokerError("missing or failed required checks")
-                response = self._client.create_review(request.repository, request.pull_request,
-                                                      event=request.decision, body=request.body)
+                response = self._github_call(self._client.create_review, request.repository,
+                                             request.pull_request, event=request.decision,
+                                             body=request.body)
                 self._record(request, outcome="accepted", exit_status=0, response=response)
                 return {k: response[k] for k in ("id", "node_id", "html_url") if k in response}
             except TimeoutError as exc:
