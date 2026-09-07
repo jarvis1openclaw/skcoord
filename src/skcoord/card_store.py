@@ -1367,6 +1367,11 @@ def _task_view_from_card(card):
         priority = TaskPriority(card.priority)
     except ValueError:
         priority = TaskPriority.MEDIUM
+    meta = dict(card.meta)
+    # ponytail: fold updated_at into meta so archive-done can age by completion
+    # without widening the Task schema; created_at remains the birth fact.
+    if card.updated_at:
+        meta.setdefault("_board_updated_at", card.updated_at)
     task = Task(
         id=card.id,
         title=card.title,
@@ -1377,7 +1382,7 @@ def _task_view_from_card(card):
         created_at=card.created_at,
         acceptance_criteria=list(card.acceptance_criteria),
         dependencies=list(card.dependencies),
-        meta=dict(card.meta),
+        meta=meta,
     )
     status = TaskStatus(_COLUMN_TO_STATUS.get(card.status.value, "open"))
     return TaskView(task=task, status=status, claimed_by=card.owner)

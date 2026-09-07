@@ -1707,6 +1707,25 @@ class Board:
             )
         return views
 
+    @staticmethod
+    def _parse_board_timestamp(raw: object, *, cutoff: datetime) -> datetime:
+        """Parse an ISO timestamp; unparseable values count as older than cutoff."""
+        try:
+            ts = datetime.fromisoformat(str(raw))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
+        except (ValueError, TypeError):
+            return cutoff - timedelta(days=1)
+
+    @staticmethod
+    def _is_human_held_task(task: Task) -> bool:
+        """True when backlog aging must not treat the card as abandoned."""
+        tags = {str(tag).lower() for tag in task.tags}
+        if "human-gate" in tags:
+            return True
+        return "[human]" in task.title.lower()
+
     def archive_done_tasks(
         self,
         older_than_days: int = 14,
@@ -1715,10 +1734,12 @@ class Board:
     ) -> list[str]:
         """Age done tasks off the active board.
 
-        A done task is eligible when its age (from the task's created_at, the
-        only timestamp available on the derived-status model) exceeds
-        ``older_than_days``. Archiving appends to this host's archive index and
-        never mutates the task file.
+        Status for eligibility prefers the authoritative legacy claim/completion
+        projection (Phase 4e). CardStore-only done cards are also eligible, and
+        CardStore ``updated_at`` is preferred as the completion age when present.
+
+        Archiving appends to this host's archive index and never mutates the
+        task file.
 
         Args:
             older_than_days: Age threshold in days.
@@ -1730,22 +1751,44 @@ class Board:
         """
         ref = now or datetime.now(timezone.utc)
         cutoff = ref - timedelta(days=older_than_days)
-        eligible: list[str] = []
-        # Authoritative legacy status: never age off a task on best-effort store
-        # state (a completion recorded only in the legacy agent file must count).
+        done_ages: dict[str, object] = {}
+
+        # Authoritative legacy status: a completion recorded only in the legacy
+        # agent file must count even when the store mirror is behind.
         for view in self._legacy_task_views():
             if view.status != TaskStatus.DONE:
                 continue
-            created = view.task.created_at
-            try:
-                ts = datetime.fromisoformat(created)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                # No parseable timestamp: treat as old enough to archive.
-                ts = cutoff - timedelta(days=1)
+            done_ages[view.task.id] = (
+                view.task.meta.get("_board_updated_at") or view.task.created_at
+            )
+
+        # CardStore may hold done cards with no legacy task file (cutover gap).
+        try:
+            from . import card_store
+            from .card import Column
+
+            if card_store.card_store_read_enabled():
+                store = card_store.CardStore(self.home)
+                for card in store.list_cards(
+                    include_archived=False, degrade_unreadable=True
+                ):
+                    if getattr(card.kind, "value", card.kind) not in ("task", "epic"):
+                        continue
+                    if card.status != Column.DONE:
+                        continue
+                    age = card.updated_at or card.created_at or done_ages.get(card.id)
+                    if card.updated_at:
+                        done_ages[card.id] = card.updated_at
+                    else:
+                        done_ages.setdefault(card.id, age)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CardStore archive scan failed: %s", exc)
+
+        eligible: list[str] = []
+        for tid, age_raw in done_ages.items():
+            ts = self._parse_board_timestamp(age_raw, cutoff=cutoff)
             if ts <= cutoff:
-                eligible.append(view.task.id)
+                eligible.append(tid)
         if not dry_run:
             for tid in eligible:
                 self.archive_task(tid, by="archive-done")
@@ -1759,9 +1802,11 @@ class Board:
     ) -> list[str]:
         """Archive ancient unclaimed open tasks (backlog rot).
 
-        Only tasks that are still OPEN (never claimed, never worked) and whose
-        created_at exceeds ``older_than_days`` are eligible. Conservative by
-        default so live backlog is not swept prematurely.
+        Only tasks that are still OPEN on the authoritative legacy projection
+        (never claimed, never worked) and whose created_at exceeds
+        ``older_than_days`` are eligible. Cards tagged ``human-gate`` or titled
+        with ``[HUMAN]`` are skipped so recorded decisions are not archived as
+        abandoned backlog.
 
         Args:
             older_than_days: Age threshold in days.
@@ -1779,18 +1824,56 @@ class Board:
         for view in self._legacy_task_views():
             if view.status != TaskStatus.OPEN:
                 continue
-            try:
-                ts = datetime.fromisoformat(view.task.created_at)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                ts = cutoff - timedelta(days=1)
+            if self._is_human_held_task(view.task):
+                continue
+            ts = self._parse_board_timestamp(view.task.created_at, cutoff=cutoff)
             if ts <= cutoff:
                 eligible.append(view.task.id)
         if not dry_run:
             for tid in eligible:
                 self.archive_task(tid, by="age-backlog")
         return eligible
+
+    def prune_stale_locks(
+        self,
+        older_than_days: int = 7,
+        now: Optional[datetime] = None,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Remove idle coordination lock files older than the threshold.
+
+        Lock files are empty flock targets. Stale ones accumulate under
+        Syncthing and slow directory scans. Only unlinks by mtime; does not
+        touch locks newer than the cutoff.
+
+        Args:
+            older_than_days: Keep locks touched more recently than this.
+            now: Reference time (defaults to UTC now); injectable for tests.
+            dry_run: When True, return paths that would be removed.
+
+        Returns:
+            list[str]: Relative lock filenames removed (or that would be).
+        """
+        ref = now or datetime.now(timezone.utc)
+        cutoff_ts = (ref - timedelta(days=older_than_days)).timestamp()
+        locks_dir = self.coord_dir / "locks"
+        removed: list[str] = []
+        if not locks_dir.is_dir():
+            return removed
+        for path in sorted(locks_dir.glob("*.lock")):
+            try:
+                if path.stat().st_mtime > cutoff_ts:
+                    continue
+            except OSError:
+                continue
+            removed.append(path.name)
+            if not dry_run:
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    logger.warning("Failed to prune lock %s: %s", path.name, exc)
+                    removed.pop()
+        return removed
 
     def _claim_task(
         self, agent_name: str, task_id: str, force: bool = False
@@ -2194,8 +2277,18 @@ class Board:
             _mint_joules_for_task(self, task_id, canonical)
         return agent
 
-    def generate_board_md(self) -> str:
+    def generate_board_md(
+        self,
+        include_done: bool = False,
+        include_idle_agents: bool = False,
+    ) -> str:
         """Generate a human-readable BOARD.md from current state.
+
+        Args:
+            include_done: When False (default), list live columns only and
+                summarize Done as a count so agents are not flooded.
+            include_idle_agents: When False (default), list only agents with a
+                current task or non-idle state.
 
         Returns:
             Markdown string for the board overview.
@@ -2210,12 +2303,13 @@ class Board:
             "",
         ]
 
+        done_views = [v for v in views if v.status == TaskStatus.DONE]
         for section_status, header in [
             (TaskStatus.IN_PROGRESS, "In Progress"),
             (TaskStatus.CLAIMED, "Claimed"),
             (TaskStatus.OPEN, "Open"),
             (TaskStatus.BLOCKED, "Blocked"),
-            (TaskStatus.DONE, "Done"),
+            (TaskStatus.REVIEW, "Review"),
         ]:
             section_tasks = [v for v in views if v.status == section_status]
             if not section_tasks:
@@ -2234,10 +2328,34 @@ class Board:
                     lines.append(f"  > {t.description[:120]}")
             lines.append("")
 
-        if agents:
-            lines.append("## Agents")
+        if include_done and done_views:
+            lines.append(f"## Done ({len(done_views)})")
             lines.append("")
-            for ag in agents:
+            for v in done_views:
+                t = v.task
+                assignee = f" @{v.claimed_by}" if v.claimed_by else ""
+                lines.append(f"- **[{t.id}]** {t.title}{assignee}")
+            lines.append("")
+        elif done_views:
+            lines.append(f"## Done ({len(done_views)} hidden)")
+            lines.append("")
+            lines.append(
+                "- Done rows omitted from the default board. "
+                "Regenerate with include_done=True or `coord status --include-done`."
+            )
+            lines.append("")
+
+        if agents:
+            shown = agents
+            if not include_idle_agents:
+                shown = [
+                    ag
+                    for ag in agents
+                    if ag.current_task or ag.state == AgentState.ACTIVE
+                ]
+            lines.append(f"## Agents ({len(shown)}" + (f" of {len(agents)}" if len(shown) != len(agents) else "") + ")")
+            lines.append("")
+            for ag in shown:
                 state_icon = {"active": "🟢", "idle": "🟡", "offline": "⚫"}.get(
                     ag.state.value, "?"
                 )
@@ -2249,14 +2367,14 @@ class Board:
 
         return "\n".join(lines)
 
-    def write_board_md(self) -> Path:
+    def write_board_md(self, include_done: bool = False) -> Path:
         """Write BOARD.md to the coordination directory.
 
         Returns:
             Path to the written file.
         """
         self.ensure_dirs()
-        content = self.generate_board_md()
+        content = self.generate_board_md(include_done=include_done)
         path = self.coord_dir / "BOARD.md"
         atomic_write_text(path, content)
         return path
@@ -2428,14 +2546,15 @@ When you update your agent file or create a task, it propagates to:
 """
 
 
-def get_briefing_text(home: Path) -> str:
+def get_briefing_text(home: Path, include_done: bool = False) -> str:
     """Return the full coordination protocol as plain text.
 
     Appends a live snapshot of current tasks and agents if the
-    coordination directory exists.
+    coordination directory exists. Done cards are summarized by default.
 
     Args:
         home: Path to ~/.skcapstone
+        include_done: When True, list every done card in the snapshot.
 
     Returns:
         Protocol text with optional live status appended.
@@ -2443,16 +2562,24 @@ def get_briefing_text(home: Path) -> str:
     text = _BRIEFING_PROTOCOL
 
     board = Board(home)
-    tasks = board.load_tasks()
+    views = board.get_task_views()
     agents = board.load_agents()
 
-    if tasks or agents:
+    if views or agents:
         text += "\n## Current Board Snapshot\n\n"
-        views = board.get_task_views()
-        for v in views:
+        live = [v for v in views if v.status != TaskStatus.DONE]
+        done = [v for v in views if v.status == TaskStatus.DONE]
+        snapshot = list(live)
+        if include_done:
+            snapshot.extend(done)
+        else:
+            text += f"  Done cards hidden: {len(done)} (pass include_done=True for full list)\n"
+        for v in snapshot:
             status_icon = {
                 "open": "[ ]",
                 "claimed": "[~]",
+                "in_progress": "[>]",
+                "review": "[?]",
                 "done": "[x]",
             }.get(v.status.value, "[?]")
             text += f"  {status_icon} [{v.task.id}] {v.task.title}"
@@ -2461,8 +2588,9 @@ def get_briefing_text(home: Path) -> str:
             text += "\n"
 
         if agents:
-            text += "\n### Active Agents\n\n"
-            for ag in agents:
+            active = [ag for ag in agents if ag.current_task or ag.state == AgentState.ACTIVE]
+            text += f"\n### Active Agents ({len(active)} of {len(agents)})\n\n"
+            for ag in active:
                 text += f"  - {ag.agent} ({ag.state.value})"
                 if ag.current_task:
                     text += f" -> {ag.current_task}"
@@ -2471,13 +2599,14 @@ def get_briefing_text(home: Path) -> str:
     return text
 
 
-def get_briefing_json(home: Path) -> str:
+def get_briefing_json(home: Path, include_done: bool = False) -> str:
     """Return the coordination protocol and live state as JSON.
 
     Useful for machine consumption by agents that prefer structured data.
 
     Args:
         home: Path to ~/.skcapstone
+        include_done: When True, include done tasks in the tasks array.
 
     Returns:
         JSON string with protocol info and current board state.
@@ -2485,10 +2614,15 @@ def get_briefing_json(home: Path) -> str:
     board = Board(home)
     views = board.get_task_views()
     agents = board.load_agents()
+    done_count = sum(1 for v in views if v.status == TaskStatus.DONE)
+    if not include_done:
+        views = [v for v in views if v.status != TaskStatus.DONE]
+    active_agents = [ag for ag in agents if ag.current_task or ag.state == AgentState.ACTIVE]
 
     payload = {
         "protocol_version": "1.0",
         "coordination_dir": str(board.coord_dir),
+        "done_hidden": done_count if not include_done else 0,
         "commands": {
             "status": "skcapstone coord status",
             "create": 'skcapstone coord create --title "..." --by <agent>',
@@ -2496,6 +2630,7 @@ def get_briefing_json(home: Path) -> str:
             "complete": "skcapstone coord complete <id> --agent <name>",
             "board": "skcapstone coord board",
             "briefing": "skcapstone coord briefing",
+            "maintain": "skcapstone coord maintain",
         },
         "rules": [
             "Read before you write",
@@ -2530,7 +2665,7 @@ def get_briefing_json(home: Path) -> str:
                 "claimed": ag.claimed_tasks,
                 "completed": ag.completed_tasks,
             }
-            for ag in agents
+            for ag in active_agents
         ],
     }
     return json.dumps(payload, indent=2)

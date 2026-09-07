@@ -11,6 +11,16 @@ version (setuptools-scm); a push to `main` cuts the next patch tag (see
 
 ### Added
 
+- A constrained exact-head GitHub review broker now requires a terminal local
+  CI-parity receipt before submitting a review. The broker verifies the exact
+  canonical receipt bytes, atomically reserves each request across processes,
+  requires completed-success checks, and never retries an uncertain review
+  side effect. Card `dec5a948`.
+
+- Board scan-cost helpers: `Board.prune_stale_locks`, live-only defaults for
+  `generate_board_md` / `get_briefing_*` (`include_done`), and CardStore folds
+  that stash `_board_updated_at` for archive aging. Cards b0a0d002/b0a0d003/b0a0d005.
+
 - Hash-chain event log integrity: `append_event` now computes `prev_hash`
   (SHA-256 of the preceding line in the same writer file) and `_read_events`
   verifies the chain at fold time. Tamper or truncation raises `ValueError`
@@ -32,6 +42,11 @@ version (setuptools-scm); a push to `main` cuts the next patch tag (see
   unchanged.
 
 ### Fixed
+
+- `archive_done_tasks` ages done cards from the legacy+CardStore union and
+  prefers CardStore `updated_at` as completion time, while `age_stale_open`
+  still trusts authoritative legacy claim status and skips `human-gate` /
+  `[HUMAN]` cards.
 
 - Card daeac75b refreshes the exact guarded claim-conflict release candidate
   against current main while preserving authoritative owner state and requiring
