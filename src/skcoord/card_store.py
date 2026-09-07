@@ -1490,7 +1490,11 @@ def task_view_page_from_store(
         validate_card_lock_identifier(card_id)
         if previous is not None and card_id <= previous:
             raise ValueError("task-view owner reader returned an unstable order")
-        card = store.fold(card_id)
+        try:
+            card = store.fold(card_id)
+        except Exception as exc:  # noqa: BLE001 - one-card fault boundary
+            logger.error("CardStore card %s is unreadable: %s", card_id, exc)
+            card = store._unreadable_card(card_id, exc)
         if (
             card is None
             or card.id != card_id

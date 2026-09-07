@@ -277,6 +277,30 @@ def test_stale_record_unstable_owner_and_invalid_limits_fail_closed(tmp_path: Pa
             board.get_task_view_page(owner.read_scope(), limit=limit)
 
 
+def test_one_unreadable_card_does_not_abort_bounded_estate_scan(tmp_path: Path) -> None:
+    owner = OwnerIndex(("public-000", "public-001", "public-002"))
+
+    def fold(_store, card_id):
+        if card_id == "public-001":
+            raise ValueError("CardStore event chain broken")
+        return _card(card_id)
+
+    with patch.object(CardStore, "fold", fold):
+        page = Board(tmp_path).get_task_view_page(owner.read_scope(), limit=2)
+
+    assert [item.task.id for item in page.items] == ["public-000", "public-001"]
+    unreadable = page.items[1].task
+    assert unreadable.meta == {
+        "unreadable": True,
+        "source": "cards/public-001",
+        "reason": "CardStore event chain broken",
+    }
+    assert unreadable.tags == ["unreadable"]
+    assert page.has_more is True
+    assert page.next_cursor
+    assert page.eligible_records_touched == 3
+
+
 def test_owner_cannot_exceed_limit_plus_one(tmp_path: Path) -> None:
     scope = TaskViewReadScope(
         authorization_scope="public-synthetic:tenant-a",
