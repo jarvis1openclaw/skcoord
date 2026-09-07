@@ -43,6 +43,10 @@ version (setuptools-scm); a push to `main` cuts the next patch tag (see
 
 ### Fixed
 
+- Bounded CardStore estate scans now isolate an unreadable card instead of
+  aborting the whole page, while direct folds remain strict and source event
+  bytes remain untouched. Card c0bfab02.
+
 - `archive_done_tasks` ages done cards from the legacy+CardStore union and
   prefers CardStore `updated_at` as completion time, while `age_stale_open`
   still trusts authoritative legacy claim status and skips `human-gate` /
