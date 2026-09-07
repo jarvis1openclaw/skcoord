@@ -13,6 +13,7 @@ import pytest
 from skcoord.card import Card, Column, Kind
 from skcoord.card_store import (
     _TASK_VIEW_CURSOR_MAX_ENCODED_BYTES,
+    CardCore,
     CardStore,
     _task_view_cursor,
     _task_view_cursor_position,
@@ -275,6 +276,60 @@ def test_stale_record_unstable_owner_and_invalid_limits_fail_closed(tmp_path: Pa
     for limit in (0, 201, True, 1.5):
         with pytest.raises(ValueError, match="between 1 and 200"):
             board.get_task_view_page(owner.read_scope(), limit=limit)
+
+
+def test_one_unreadable_card_does_not_abort_bounded_estate_scan(tmp_path: Path) -> None:
+    owner = OwnerIndex(("public-000", "public-001", "public-002"))
+
+    def fold(_store, card_id):
+        if card_id == "public-001":
+            raise ValueError("CardStore event chain broken")
+        return _card(card_id)
+
+    with patch.object(CardStore, "fold", fold):
+        page = Board(tmp_path).get_task_view_page(owner.read_scope(), limit=2)
+
+    assert [item.task.id for item in page.items] == ["public-000", "public-001"]
+    unreadable = page.items[1].task
+    assert unreadable.meta == {
+        "unreadable": True,
+        "source": "cards/public-001",
+        "reason": "CardStore event chain broken",
+    }
+    assert unreadable.tags == ["unreadable"]
+    assert page.has_more is True
+    assert page.next_cursor
+    assert page.eligible_records_touched == 3
+
+
+def test_broken_prev_hash_is_degraded_without_changing_event_bytes(tmp_path: Path) -> None:
+    store = CardStore(tmp_path)
+    card_ids = ("public-000", "public-001", "public-002")
+    for card_id in card_ids:
+        store.create(CardCore(id=card_id, title=f"Card {card_id}"))
+    store.append_event("public-001", "note", "fixture", text="first")
+    store.append_event("public-001", "note", "fixture", text="second")
+
+    event_path = next((store.cards_dir / "public-001" / "events").glob("*.jsonl"))
+    lines = event_path.read_bytes().splitlines(keepends=True)
+    second_event = json.loads(lines[1])
+    declared_prev_hash = second_event["prev_hash"].encode("ascii")
+    assert len(declared_prev_hash) == 64
+    lines[1] = lines[1].replace(declared_prev_hash, b"0" * 64, 1)
+    event_path.write_bytes(b"".join(lines))
+    corrupt_bytes = event_path.read_bytes()
+
+    with pytest.raises(ValueError, match="public-001.*prev_hash mismatch"):
+        store.fold("public-001")
+
+    page = Board(tmp_path).get_task_view_page(OwnerIndex(card_ids).read_scope(), limit=2)
+
+    assert [item.task.id for item in page.items] == ["public-000", "public-001"]
+    assert page.items[1].task.meta["unreadable"] is True
+    assert "prev_hash mismatch" in page.items[1].task.meta["reason"]
+    assert event_path.read_bytes() == corrupt_bytes
+    assert page.has_more is True
+    assert page.eligible_records_touched == 3
 
 
 def test_owner_cannot_exceed_limit_plus_one(tmp_path: Path) -> None:
