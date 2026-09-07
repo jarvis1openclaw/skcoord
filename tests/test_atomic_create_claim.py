@@ -34,6 +34,48 @@ def test_create_claimed_task_retry_returns_same_revision(tmp_path, monkeypatch):
     assert second[1] == first[1]
 
 
+def test_create_claimed_task_retry_after_new_current_task_is_read_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKCOORD_CARD_STORE", "1")
+    board = Board(tmp_path)
+    first = Task(id="a1b2c3e3", title="First", created_by="maker")
+    second = Task(id="a1b2c3e4", title="Second", created_by="maker")
+    board.create_claimed_task(first, "maker")
+    board.create_claimed_task(second, "maker")
+
+    def snapshot():
+        roots = (
+            tmp_path / "cards",
+            tmp_path / "coordination" / "tasks",
+            tmp_path / "coordination" / "agents",
+        )
+        return {
+            path.relative_to(tmp_path): path.read_bytes()
+            for root in roots
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    with pytest.raises(ValueError, match="claim is no longer current"):
+        board.create_claimed_task(first, "maker")
+
+    assert snapshot() == before
+    agent = board.load_agent("maker")
+    assert agent is not None
+    assert agent.current_task == second.id
+    store = CardStore(tmp_path)
+    first_card = store.fold(first.id)
+    second_card = store.fold(second.id)
+    assert first_card is not None and (first_card.owner, first_card.status.value) == (
+        "maker",
+        "ready",
+    )
+    assert second_card is not None and (second_card.owner, second_card.status.value) == (
+        "maker",
+        "doing",
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "changed"),
     [

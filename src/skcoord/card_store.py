@@ -1940,6 +1940,16 @@ def mirror_coord_create_claimed(
     if existing is not None:
         if CardCore.model_validate(existing).model_dump() != expected.model_dump():
             raise ValueError(f"CardStore create-and-claim conflict for {task.id}")
+        current = store.fold(task.id)
+        if (
+            current is None
+            or current.owner != owner
+            or current.status != _CLAIM_COLUMN
+            or current.meta.get("_claim_revision") != revision
+        ):
+            raise ValueError(
+                f"CardStore create-and-claim claim is no longer current for {task.id}"
+            )
         return revision
 
     store.create(expected)

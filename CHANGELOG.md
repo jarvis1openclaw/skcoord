@@ -45,7 +45,8 @@ version (setuptools-scm); a push to `main` cuts the next patch tag (see
 
 - Atomic create-and-claim retries now require exact equality across every
   immutable card field before accepting an existing ID, including concurrent
-  same-owner requests with different payloads. Card c1a1c003.
+  same-owner requests with different payloads. An exact replay also fails
+  read-only when its original claim is no longer current. Card c1a1c003.
 
 - Bounded CardStore estate scans now isolate an unreadable card instead of
   aborting the whole page, while direct folds remain strict and source event
