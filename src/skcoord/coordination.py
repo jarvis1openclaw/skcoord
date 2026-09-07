@@ -873,6 +873,55 @@ class Board:
         atomic_write_text(path, json.dumps(task.model_dump(), indent=2) + "\n")
         return path
 
+    def create_claimed_task(self, task: Task, agent_name: str) -> tuple[Path, str]:
+        """Create a task whose authoritative first fold is owned by ``agent_name``."""
+        from .card_store import (
+            CardStore,
+            card_store_write_enabled,
+            mirror_coord_create_claimed,
+        )
+
+        canonical = AgentFile.validate_agent_name(agent_name)
+        if not card_store_write_enabled():
+            raise ValueError("atomic create-and-claim requires the CardStore")
+        with _board_mutation_lock(self.home):
+            if task.dependencies:
+                views = {
+                    view.task.id: view for view in self.get_task_views(include_archived=True)
+                }
+                incomplete = [
+                    dependency
+                    for dependency in task.dependencies
+                    if dependency not in views
+                    or views[dependency].status != TaskStatus.DONE
+                ]
+                if incomplete:
+                    raise ValueError(
+                        f"Task {task.id} has incomplete dependencies: {', '.join(incomplete)}"
+                    )
+            revision = mirror_coord_create_claimed(self.home, task, canonical)
+            self.ensure_dirs()
+            slug = _slugify_filename(task.title)[:40]
+            path = self.tasks_dir / f"{task.id}-{slug}.json"
+            atomic_write_text(path, json.dumps(task.model_dump(), indent=2) + "\n")
+            agent, bumped = self._claim_task(canonical, task.id)
+            if bumped is not None:
+                self._mirror_card_store(
+                    "demote",
+                    task_id=bumped,
+                    agent=canonical,
+                    transition_id=uuid.uuid4().hex,
+                )
+            card = CardStore(self.home).fold(task.id)
+            if (
+                card is None
+                or card.owner != agent.agent
+                or card.status.value != "doing"
+                or card.meta.get("_claim_revision") != revision
+            ):
+                raise RuntimeError("atomic create-and-claim readback failed")
+            return path, revision
+
     def _mirror_card_store(self, op: str, **kw) -> None:
         """Flag-gated dual-write into the event-sourced CardStore (Phase 4).
 
@@ -1769,9 +1818,7 @@ class Board:
 
             if card_store.card_store_read_enabled():
                 store = card_store.CardStore(self.home)
-                for card in store.list_cards(
-                    include_archived=False, degrade_unreadable=True
-                ):
+                for card in store.list_cards(include_archived=False, degrade_unreadable=True):
                     if getattr(card.kind, "value", card.kind) not in ("task", "epic"):
                         continue
                     if card.status != Column.DONE:
@@ -2348,12 +2395,12 @@ class Board:
         if agents:
             shown = agents
             if not include_idle_agents:
-                shown = [
-                    ag
-                    for ag in agents
-                    if ag.current_task or ag.state == AgentState.ACTIVE
-                ]
-            lines.append(f"## Agents ({len(shown)}" + (f" of {len(agents)}" if len(shown) != len(agents) else "") + ")")
+                shown = [ag for ag in agents if ag.current_task or ag.state == AgentState.ACTIVE]
+            lines.append(
+                f"## Agents ({len(shown)}"
+                + (f" of {len(agents)}" if len(shown) != len(agents) else "")
+                + ")"
+            )
             lines.append("")
             for ag in shown:
                 state_icon = {"active": "🟢", "idle": "🟡", "offline": "⚫"}.get(
