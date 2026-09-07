@@ -1908,52 +1908,45 @@ def mirror_coord_create_claimed(
     claim_revision: str = "",
 ) -> str:
     """Create a card whose first observable fold is already claimed."""
-    existing = CardStore(home).fold(task.id)
-    if existing is not None:
-        revision = existing.meta.get("_claim_revision")
-        if (
-            existing.owner == owner
-            and existing.title == task.title
-            and isinstance(revision, str)
-            and revision
-        ):
-            return revision
-        raise ValueError(f"CardStore create-and-claim conflict for {task.id}")
-    revision = claim_revision or uuid.uuid4().hex
     from .card import _swimlane_for_tags
 
     tags_lower = {t.lower() for t in task.tags}
     kind = "epic" if "epic" in tags_lower else "task"
     store = CardStore(home)
-    store.create(
-        CardCore(
-            id=task.id,
-            kind=kind,
-            title=task.title,
-            description=task.description,
-            created_by=task.created_by,
-            created_at=task.created_at,
-            acceptance_criteria=list(getattr(task, "acceptance_criteria", []) or []),
-            dependencies=list(task.dependencies),
-            initial_priority=task.priority.value,
-            initial_swimlane=_swimlane_for_tags(task.tags),
-            initial_labels=list(task.tags),
-            initial_owner=owner,
-            initial_claim_revision=revision,
-            meta=dict(task.meta),
-        )
+    existing = store._load_core(task.id)
+    if existing is not None:
+        stored_revision = existing.get("initial_claim_revision")
+        if not isinstance(stored_revision, str) or not stored_revision:
+            raise ValueError(f"CardStore create-and-claim conflict for {task.id}")
+        revision = claim_revision or stored_revision
+    else:
+        revision = claim_revision or uuid.uuid4().hex
+    expected = CardCore(
+        id=task.id,
+        kind=kind,
+        title=task.title,
+        description=task.description,
+        created_by=task.created_by,
+        created_at=task.created_at,
+        acceptance_criteria=list(getattr(task, "acceptance_criteria", []) or []),
+        dependencies=list(task.dependencies),
+        initial_priority=task.priority.value,
+        initial_swimlane=_swimlane_for_tags(task.tags),
+        initial_labels=list(task.tags),
+        initial_owner=owner,
+        initial_claim_revision=revision,
+        meta=dict(task.meta),
     )
-    card = store.fold(task.id)
-    actual_revision = card.meta.get("_claim_revision") if card is not None else None
-    if (
-        card is None
-        or card.owner != owner
-        or card.title != task.title
-        or not isinstance(actual_revision, str)
-        or not actual_revision
-    ):
+    if existing is not None:
+        if CardCore.model_validate(existing).model_dump() != expected.model_dump():
+            raise ValueError(f"CardStore create-and-claim conflict for {task.id}")
+        return revision
+
+    store.create(expected)
+    created = store._load_core(task.id)
+    if created is None or CardCore.model_validate(created).model_dump() != expected.model_dump():
         raise ValueError(f"CardStore create-and-claim conflict for {task.id}")
-    return actual_revision
+    return revision
 
 
 def mirror_coord_claim(
