@@ -5,6 +5,7 @@ can submit a review, but never supply (or receive) GitHub credentials or an
 arbitrary API operation.  Audit records are append-only JSON lines and are
 validated before they are written.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +14,8 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -26,7 +28,9 @@ class BrokerError(ValueError):
 class GitHubClient(Protocol):
     def pull_request(self, repository: str, number: int) -> Mapping[str, Any]: ...
     def required_checks(self, repository: str, sha: str) -> Mapping[str, str]: ...
-    def create_review(self, repository: str, number: int, *, event: str, body: str) -> Mapping[str, Any]: ...
+    def create_review(
+        self, repository: str, number: int, *, event: str, body: str
+    ) -> Mapping[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,10 @@ class ReviewRequest:
     pull_request: int
     head: str
     evidence_hash: str
+    preflight_hash: str
+    preflight_head: str
+    preflight_state: str
+    preflight_checks: tuple[str, ...]
     decision: str  # approve or request-changes
     body: str = ""
     request_id: str = ""
@@ -45,13 +53,29 @@ _HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _ALLOWED_EVENTS = {"approve", "request-changes"}
 _TERMINAL_SUCCESS = {"success", "completed", "passed"}
+_REQUIRED_PREFLIGHT = {
+    "diff",
+    "black",
+    "ruff",
+    "docs",
+    "gitleaks",
+    "shim-imports",
+    "tests",
+}
 
 
 class GitHubReviewBroker:
     """Submit only an exact-head review after all independent gates pass."""
 
-    def __init__(self, client: GitHubClient, *, allowlisted_repositories: set[str],
-                 reviewer: str, audit_path: str | Path, timeout_seconds: float = 30.0):
+    def __init__(
+        self,
+        client: GitHubClient,
+        *,
+        allowlisted_repositories: set[str],
+        reviewer: str,
+        audit_path: str | Path,
+        timeout_seconds: float = 30.0,
+    ):
         if not allowlisted_repositories:
             raise ValueError("repository allowlist must not be empty")
         self._client = client
@@ -65,7 +89,10 @@ class GitHubReviewBroker:
     def _serialize(record: Mapping[str, Any]) -> str:
         # A single canonical serializer prevents hand-built JSON and secret
         # leakage through accidental values.
-        return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        return (
+            json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            + "\n"
+        )
 
     def _audit(self, record: Mapping[str, Any]) -> None:
         line = self._serialize(record)
@@ -79,25 +106,47 @@ class GitHubReviewBroker:
             stream.write(line)
             stream.flush()
 
-    def _record(self, request: ReviewRequest, *, outcome: str, exit_status: int,
-                response: Mapping[str, Any] | None = None, error: str | None = None) -> None:
+    def _record(
+        self,
+        request: ReviewRequest,
+        *,
+        outcome: str,
+        exit_status: int,
+        response: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
         safe_response = {}
         if response:
             # GitHub response fields are intentionally allowlisted.
             for key in ("id", "node_id", "user", "submitted_at", "html_url"):
                 if key in response:
                     value = response[key]
-                    safe_response[key] = value.get("login") if key == "user" and isinstance(value, Mapping) else value
-        self._audit({
-            "type": "github_review_result", "request_id": request.request_id,
-            "caller": request.caller, "repository": request.repository,
-            "pull_request": request.pull_request, "head": request.head,
-            "evidence_hash": request.evidence_hash, "decision": request.decision,
-            "reviewer": self._reviewer, "github_review_identity": self._reviewer,
-            "response": safe_response, "timestamp": time.time(),
-            "exit_status": exit_status, "outcome": outcome,
-            **({"error": error} if error else {}),
-        })
+                    safe_response[key] = (
+                        value.get("login")
+                        if key == "user" and isinstance(value, Mapping)
+                        else value
+                    )
+        self._audit(
+            {
+                "type": "github_review_result",
+                "request_id": request.request_id,
+                "caller": request.caller,
+                "repository": request.repository,
+                "pull_request": request.pull_request,
+                "head": request.head,
+                "evidence_hash": request.evidence_hash,
+                "preflight_hash": request.preflight_hash,
+                "preflight_head": request.preflight_head,
+                "decision": request.decision,
+                "reviewer": self._reviewer,
+                "github_review_identity": self._reviewer,
+                "response": safe_response,
+                "timestamp": time.time(),
+                "exit_status": exit_status,
+                "outcome": outcome,
+                **({"error": error} if error else {}),
+            }
+        )
 
     def _github_call(self, method: Any, *args: Any, **kwargs: Any) -> Any:
         """Run an untrusted network adapter call under the broker deadline."""
@@ -116,12 +165,23 @@ class GitHubReviewBroker:
     def submit_review(self, request: ReviewRequest) -> Mapping[str, Any]:
         """Validate and submit one review; failures are audited and raised."""
         if not request.request_id:
-            request = ReviewRequest(**{**request.__dict__, "request_id": str(uuid.uuid4())})
-        event = {"type": "github_review_request", "request_id": request.request_id,
-                 "caller": request.caller, "repository": request.repository,
-                 "pull_request": request.pull_request, "head": request.head,
-                 "evidence_hash": request.evidence_hash, "decision": request.decision,
-                 "reviewer": self._reviewer, "timestamp": time.time()}
+            request = ReviewRequest(
+                **{**request.__dict__, "request_id": str(uuid.uuid4())}
+            )
+        event = {
+            "type": "github_review_request",
+            "request_id": request.request_id,
+            "caller": request.caller,
+            "repository": request.repository,
+            "pull_request": request.pull_request,
+            "head": request.head,
+            "evidence_hash": request.evidence_hash,
+            "preflight_hash": request.preflight_hash,
+            "preflight_head": request.preflight_head,
+            "decision": request.decision,
+            "reviewer": self._reviewer,
+            "timestamp": time.time(),
+        }
         with self._lock:
             try:
                 # Request IDs are idempotency keys.  Scan the append-only log
@@ -131,29 +191,47 @@ class GitHubReviewBroker:
                 if self._seen_request(request.request_id):
                     raise BrokerError("replayed request")
                 self._validate(request)
-                current = self._github_call(self._client.pull_request, request.repository,
-                                             request.pull_request)
+                current = self._github_call(
+                    self._client.pull_request, request.repository, request.pull_request
+                )
                 if str(current.get("head_sha", "")) != request.head:
                     raise BrokerError("head drift")
                 if str(current.get("author", "")) == self._reviewer:
                     raise BrokerError("same-author review")
-                checks = self._github_call(self._client.required_checks, request.repository,
-                                           request.head)
-                if not checks or any(str(v).lower() not in _TERMINAL_SUCCESS for v in checks.values()):
+                checks = self._github_call(
+                    self._client.required_checks, request.repository, request.head
+                )
+                if not checks or any(
+                    str(v).lower() not in _TERMINAL_SUCCESS for v in checks.values()
+                ):
                     raise BrokerError("missing or failed required checks")
-                response = self._github_call(self._client.create_review, request.repository,
-                                             request.pull_request, event=request.decision,
-                                             body=request.body)
-                self._record(request, outcome="accepted", exit_status=0, response=response)
-                return {k: response[k] for k in ("id", "node_id", "html_url") if k in response}
+                response = self._github_call(
+                    self._client.create_review,
+                    request.repository,
+                    request.pull_request,
+                    event=request.decision,
+                    body=request.body,
+                )
+                self._record(
+                    request, outcome="accepted", exit_status=0, response=response
+                )
+                return {
+                    k: response[k]
+                    for k in ("id", "node_id", "html_url")
+                    if k in response
+                }
             except TimeoutError as exc:
-                self._record(request, outcome="timeout", exit_status=124, error="timeout")
+                self._record(
+                    request, outcome="timeout", exit_status=124, error="timeout"
+                )
                 raise BrokerError("GitHub request timed out") from exc
             except (BrokerError, ValueError) as exc:
                 self._record(request, outcome="rejected", exit_status=1, error=str(exc))
                 raise
             except Exception as exc:
-                self._record(request, outcome="error", exit_status=1, error=type(exc).__name__)
+                self._record(
+                    request, outcome="error", exit_status=1, error=type(exc).__name__
+                )
                 raise BrokerError("GitHub broker failure") from exc
 
     def _seen_request(self, request_id: str) -> bool:
@@ -162,7 +240,10 @@ class GitHubReviewBroker:
         with self._audit_path.open("r", encoding="utf-8") as stream:
             for line in stream:
                 try:
-                    if json.loads(line).get("request_id") == request_id and json.loads(line).get("type") == "github_review_result":
+                    if (
+                        json.loads(line).get("request_id") == request_id
+                        and json.loads(line).get("type") == "github_review_result"
+                    ):
                         return True
                 except json.JSONDecodeError as exc:
                     raise BrokerError("corrupt audit log") from exc
@@ -177,6 +258,14 @@ class GitHubReviewBroker:
             raise BrokerError("malformed exact head")
         if not _HEX64.fullmatch(request.evidence_hash):
             raise BrokerError("missing or malformed evidence hash")
+        if not _HEX64.fullmatch(request.preflight_hash):
+            raise BrokerError("missing or malformed local preflight hash")
+        if request.preflight_head != request.head:
+            raise BrokerError("local preflight head mismatch")
+        if request.preflight_state != "PASS":
+            raise BrokerError("local preflight did not pass")
+        if set(request.preflight_checks) != _REQUIRED_PREFLIGHT:
+            raise BrokerError("local preflight check set is incomplete")
         if request.decision not in _ALLOWED_EVENTS:
             raise BrokerError("unsupported review decision")
         if len(request.body) > 10000:
