@@ -11,6 +11,12 @@ version (setuptools-scm); a push to `main` cuts the next patch tag (see
 
 ### Added
 
+- A constrained exact-head GitHub review broker now requires a terminal local
+  CI-parity receipt before submitting a review. The broker verifies the exact
+  canonical receipt bytes, atomically reserves each request across processes,
+  requires completed-success checks, and never retries an uncertain review
+  side effect. Card `dec5a948`.
+
 - Board scan-cost helpers: `Board.prune_stale_locks`, live-only defaults for
   `generate_board_md` / `get_briefing_*` (`include_done`), and CardStore folds
   that stash `_board_updated_at` for archive aging. Cards b0a0d002/b0a0d003/b0a0d005.
